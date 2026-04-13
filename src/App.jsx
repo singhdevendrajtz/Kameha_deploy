@@ -1,186 +1,189 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import mqtt from 'mqtt';
+import React, { useState, useEffect, useRef } from 'react';
 import './App.css';
 
-const BROKER_URL = import.meta.env.VITE_MQTT_URL;
-const SUB_TOPIC = import.meta.env.VITE_MQTT_SUB_TOPIC;
-const PUB_TOPIC = import.meta.env.VITE_MQTT_PUB_TOPIC;
-const STATUS_TOPIC = "otto6/status"; // New Status Topic
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+const PUB_TOPIC = import.meta.env.VITE_HARDWARE_TOPIC;
 
-const MQTT_USER = import.meta.env.VITE_MQTT_USERNAME;
-const MQTT_PASS = import.meta.env.VITE_MQTT_PASSWORD;
-
-const OFF_KEYS = ["a", "b", "c", "d", "e", "f", "g"];
-const ON_KEYS = ["1", "2", "3", "4", "5", "6", "7"];
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const OFF_KEYS = ["a", "b", "c", "d", "e", "f"];
+const ON_KEYS = ["1", "2", "3", "4", "5", "6"];
+const FAN_STATES = ["FTRP0000", "FTRP0001", "FTRP0010", "FTRP0011", "FTRP0100"];
+const FAN_LABELS = ["Power Off", "Silent", "Normal", "Boost", "Turbo"];
 
 function App() {
-  const [client, setClient] = useState(null);
-  const [deviceStates, setDeviceStates] = useState(new Array(7).fill(false));
-  const [boardStatus, setBoardStatus] = useState('offline'); 
-  
-  const watchdogRef = useRef(null);
-  const pendingIndexRef = useRef(null); 
-  const pendingBatchRef = useRef([]);
-  const lastIntendedStateRef = useRef(null);
-  const [syncTrigger, setSyncTrigger] = useState(0);
+  const [isAuthenticated, setIsAuthenticated] = useState(!!localStorage.getItem('kameha_token'));
+  const [password, setPassword] = useState('');
+  const [deviceStates, setDeviceStates] = useState(new Array(6).fill(false));
+  const [fanValue, setFanValue] = useState(0);
+  const [boardStatus, setBoardStatus] = useState('offline');
+  const abortControllerRef = useRef(null);
 
-  const isSyncing = useMemo(() => {
-    return pendingIndexRef.current !== null || pendingBatchRef.current.length > 0;
-  }, [syncTrigger]);
-
-  const markBoardActive = () => {
-    setBoardStatus('online');
-    if (watchdogRef.current) clearTimeout(watchdogRef.current);
-    watchdogRef.current = setTimeout(() => setBoardStatus('offline'), 15000);
-  };
-
+  // --- THE LONG POLLING ENGINE ---
   useEffect(() => {
-    const mqttClient = mqtt.connect(BROKER_URL, {
-      clientId: `kameha_vfinal_${Math.random().toString(16).slice(2, 5)}`,
-      username: MQTT_USER,
-      password: MQTT_PASS,
-      reconnectPeriod: 1000,
-      clean: true,
-    });
+    if (!isAuthenticated) return;
 
-    mqttClient.on('connect', () => {
-      // Subscribing to both topics
-      mqttClient.subscribe([SUB_TOPIC, STATUS_TOPIC], () => {
-        mqttClient.publish(PUB_TOPIC, "0");
-      });
-    });
+    let isMounted = true;
 
-    mqttClient.on('message', (topic, message) => {
-      const msg = message.toString();
+    const listenForUpdates = async () => {
+      // Create an abort controller so we can cancel the request on logout/unmount
+      abortControllerRef.current = new AbortController();
 
-      // Handle the specialized status topic
-      if (topic === STATUS_TOPIC) {
-        if (msg === "online" || msg === "1") {
-          markBoardActive(); // Resets the watchdog and sets online
-        } else if (msg === "offline" || msg === "0") {
-          setBoardStatus('offline');
-          if (watchdogRef.current) clearTimeout(watchdogRef.current);
-        }
-        return; // Don't process status as a light toggle
-      }
+      try {
+        const res = await fetch(`${API_BASE_URL}/latest-updates`, {
+          signal: abortControllerRef.current.signal
+        });
+        const data = await res.json();
+        
+        if (!isMounted) return;
 
-      // Existing logic for device control
-      markBoardActive();
-      const onIdx = ON_KEYS.indexOf(msg);
-      const offIdx = OFF_KEYS.indexOf(msg);
-      const incomingIdx = onIdx !== -1 ? onIdx : offIdx;
-      const isIncomingOn = onIdx !== -1;
+        // Update UI immediately with the payload
+        setBoardStatus(data.status);
+        if (data.updates && data.updates.length > 0) {
+          setDeviceStates(prev => {
+            const newState = [...prev];
+            data.updates.forEach(msg => {
+              const onIdx = ON_KEYS.indexOf(msg);
+              const offIdx = OFF_KEYS.indexOf(msg);
+              if (onIdx !== -1) newState[onIdx] = true;
+              if (offIdx !== -1) newState[offIdx] = false;
+            });
+            return newState;
+          });
 
-      if (incomingIdx !== -1) {
-        if (lastIntendedStateRef.current !== null) {
-          const isTargeted = pendingIndexRef.current === incomingIdx || pendingBatchRef.current.includes(incomingIdx);
-          if (isTargeted) {
-            if (isIncomingOn === lastIntendedStateRef.current) {
-              if (pendingIndexRef.current === incomingIdx) pendingIndexRef.current = null;
-              pendingBatchRef.current = pendingBatchRef.current.filter(id => id !== incomingIdx);
-              if (pendingBatchRef.current.length === 0 && pendingIndexRef.current === null) lastIntendedStateRef.current = null;
-            } else {
-              mqttClient.publish(PUB_TOPIC, lastIntendedStateRef.current ? ON_KEYS[incomingIdx] : OFF_KEYS[incomingIdx]);
-              return; 
-            }
+          const fanMsg = [...data.updates].reverse().find(m => m.startsWith("FTRP"));
+          if (fanMsg) {
+            const fIdx = FAN_STATES.indexOf(fanMsg);
+            if (fIdx !== -1) setFanValue(fIdx);
           }
         }
-        setDeviceStates(prev => {
-          const next = [...prev];
-          next[incomingIdx] = isIncomingOn;
-          return next;
-        });
-        setSyncTrigger(v => v + 1);
+
+        // RECURSIVE CALL: Re-open the pipe immediately for the next message
+        listenForUpdates();
+
+      } catch (err) {
+        if (isMounted && err.name !== 'AbortError') {
+          console.log("Reconnecting in 3s...");
+          setTimeout(listenForUpdates, 3000); // Wait 3s on error to prevent CPU spike
+        }
       }
-    });
+    };
 
-    mqttClient.on('offline', () => setBoardStatus('offline'));
-    setClient(mqttClient);
-
-    const pollInterval = setInterval(() => {
-      if (mqttClient.connected) mqttClient.publish(PUB_TOPIC, "0");
-    }, 10000);
+    // Initial load: Probe hardware and start the listener
+    sendSecureCommand(PUB_TOPIC, "0");
+    listenForUpdates();
 
     return () => {
-      mqttClient.end(true);
-      clearInterval(pollInterval);
-      if (watchdogRef.current) clearTimeout(watchdogRef.current);
+      isMounted = false;
+      if (abortControllerRef.current) abortControllerRef.current.abort();
     };
-  }, []);
+  }, [isAuthenticated]);
 
-  // ... (handleToggle and executeMasterAction remain unchanged) ...
-
-  const handleToggle = (index) => {
-    if (!client?.connected || isSyncing || boardStatus === 'offline') return;
-    const newState = !deviceStates[index];
-    pendingIndexRef.current = index;
-    lastIntendedStateRef.current = newState;
-    setSyncTrigger(v => v + 1);
-    client.publish(PUB_TOPIC, newState ? ON_KEYS[index] : OFF_KEYS[index]);
+  // --- API ACTIONS ---
+  const sendSecureCommand = async (topic, message) => {
+    const token = localStorage.getItem('kameha_token');
+    try {
+      await fetch(`${API_BASE_URL}/command`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ topic, message })
+      });
+    } catch (err) { console.error("Command failed"); }
   };
 
-  const executeMasterAction = async (targetState) => {
-    if (!client?.connected || isSyncing || boardStatus === 'offline') return;
-    const targets = deviceStates.map((isOn, i) => isOn !== targetState ? i : null).filter(x => x !== null);
-    if (targets.length === 0) return;
-
-    pendingBatchRef.current = targets;
-    lastIntendedStateRef.current = targetState;
-    setSyncTrigger(v => v + 1);
-
-    for (const index of targets) {
-      if (client.connected) {
-        client.publish(PUB_TOPIC, targetState ? ON_KEYS[index] : OFF_KEYS[index]);
-        await sleep(200);
+  const login = async (e) => {
+    e.preventDefault();
+    try {
+      const res = await fetch(`${API_BASE_URL}/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password })
+      });
+      const data = await res.json();
+      if (data.token) {
+        localStorage.setItem('kameha_token', data.token);
+        setIsAuthenticated(true);
       }
-    }
+    } catch (err) { alert("Auth Server Offline"); }
   };
+
+  const logout = () => {
+    if (abortControllerRef.current) abortControllerRef.current.abort();
+    localStorage.removeItem('kameha_token');
+    setIsAuthenticated(false);
+  };
+
+  const handleToggle = (i) => {
+    const newState = !deviceStates[i];
+    // Optimistic Update for zero-lag feel
+    setDeviceStates(prev => { const n = [...prev]; n[i] = newState; return n; });
+    sendSecureCommand(PUB_TOPIC, newState ? ON_KEYS[i] : OFF_KEYS[i]);
+  };
+
+  if (!isAuthenticated) {
+    return (
+      <div className="app-viewport">
+        <div className="glass-shell login-panel">
+          <h1 className="main-logo">KAMEHA</h1>
+          <form onSubmit={login} className="login-form">
+            <input 
+              type="password" placeholder="MASTER PASS" 
+              className="m-btn login-input"
+              value={password} onChange={(e) => setPassword(e.target.value)}
+            />
+            <button type="submit" className="m-btn login-submit">ACCESS</button>
+          </form>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    // ... (JSX remains exactly the same as your original) ...
-    <div className="app-shell">
-      <div className="glass-panel">
-        <header className="main-header">
-          <div className="top-bar">
-            <h1 className="logo-text">KAMEHA</h1>
-            <div className="header-line"></div>
-          </div>
-          
-          <div className="action-bar">
-            <div className={`connection-pill ${boardStatus === 'online' ? 'connected' : 'offline'}`}>
-              <span className="dot"></span>
-              <span className="label">Board: {boardStatus === 'online' ? 'Link' : 'Lost'}</span>
-            </div>
-
-            <div className="segmented-master">
-              <button className="master-btn" onClick={() => executeMasterAction(true)} disabled={boardStatus === 'offline' || isSyncing}>All On</button>
-              <div className="button-separator"></div>
-              <button className="master-btn" onClick={() => executeMasterAction(false)} disabled={boardStatus === 'offline' || isSyncing}>All Off</button>
-            </div>
+    <div className="app-viewport">
+      <div className="glass-shell">
+        <header className="header-section">
+          <div className="logo-row" onClick={logout} style={{cursor: 'pointer'}}>
+            <div className={`status-pill ${boardStatus}`}></div>
+            <h1 className="main-logo">KAMEHA</h1>
           </div>
         </header>
 
-        <div className={`control-grid ${boardStatus === 'offline' ? 'system-locked' : ''}`}>
-          {deviceStates.map((isOn, index) => {
-            const isPending = pendingIndexRef.current === index || pendingBatchRef.current.includes(index);
-            const isFan = index === 5;
-            
-            return (
-              <button key={index} className={`smart-card ${isOn ? 'on' : 'off'} ${isPending ? 'syncing' : ''}`} onClick={() => handleToggle(index)} disabled={boardStatus === 'offline' || isSyncing}>
-                <div className="icon-wrapper">
-                  <img src={isFan ? '/fan-3.svg' : (isOn ? '/bright-light-bulb-svgrepo-com.svg' : '/light-bulb-svgrepo-com.svg')} className={(isFan && isOn) || isPending ? 'rotating-svg' : ''} alt="icon" />
-                </div>
-                <div className="card-details">
-                  <span className="device-label">{isFan ? "Ceiling Fan" : `Light 0${index + 1}`}</span>
-                  <span className="device-meta">
-                    {isPending ? <span className="sync-text">Syncing...</span> : isOn ? <span className="status-active">{isFan ? "Spinning" : "Illuminated"}</span> : <span className="status-dim">{isFan ? "Stationary" : "Powered Off"}</span>}
-                  </span>
-                </div>
-              </button>
-            );
-          })}
+        <section className="fan-panel">
+          <div className="fan-meta">
+            <span>Airflow Intensity</span>
+            <span className="fan-mode">{FAN_LABELS[fanValue]}</span>
+          </div>
+          <div className="slider-wrapper">
+            <div className="fan-dots">
+              {[0, 1, 2, 3, 4].map(d => <div key={d} className={`dot ${fanValue >= d ? 'active' : ''}`} />)}
+            </div>
+            <input 
+              type="range" min="0" max="4" step="1" value={fanValue} 
+              onChange={(e) => {
+                const v = parseInt(e.target.value);
+                setFanValue(v);
+                sendSecureCommand(PUB_TOPIC, FAN_STATES[v]);
+              }}
+              className="dot-slider"
+            />
+          </div>
+        </section>
+
+        <div className={`grid-container ${boardStatus}`}>
+          {deviceStates.map((isOn, i) => (
+            <button key={i} className={`tile ${isOn ? 'on' : ''}`} onClick={() => handleToggle(i)}>
+              <img 
+                src={i === 3 ? '/fan-3.svg' : (isOn ? '/bright-light-bulb-svgrepo-com.svg' : '/light-bulb-svgrepo-com.svg')} 
+                className={i === 3 && isOn ? 'spin' : ''} 
+                alt="icon" 
+              />
+              <div className="tile-info">
+                <span className="t-name">{i === 3 ? "Main Fan" : `Light 0${i + 1}`}</span>
+                <span className="t-status">{isOn ? 'ACTIVE' : 'IDLE'}</span>
+              </div>
+            </button>
+          ))}
         </div>
       </div>
     </div>
