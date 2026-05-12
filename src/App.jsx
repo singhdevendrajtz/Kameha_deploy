@@ -12,30 +12,40 @@ const FAN_LABELS = ["Power Off", "Silent", "Normal", "Boost", "Turbo"];
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(!!localStorage.getItem('kameha_token'));
   const [password, setPassword] = useState('');
+  const [errorMsg, setErrorMsg] = useState(''); 
   const [deviceStates, setDeviceStates] = useState(new Array(6).fill(false));
   const [fanValue, setFanValue] = useState(0);
   const [boardStatus, setBoardStatus] = useState('offline');
   const abortControllerRef = useRef(null);
 
-  // --- THE LONG POLLING ENGINE ---
+  const logout = (isExpired = false) => {
+    if (abortControllerRef.current) abortControllerRef.current.abort();
+    localStorage.removeItem('kameha_token');
+    setIsAuthenticated(false);
+    if (isExpired) {
+      setErrorMsg('Session expired. Please login again.');
+    }
+  };
+
   useEffect(() => {
     if (!isAuthenticated) return;
-
     let isMounted = true;
 
     const listenForUpdates = async () => {
-      // Create an abort controller so we can cancel the request on logout/unmount
       abortControllerRef.current = new AbortController();
-
       try {
         const res = await fetch(`${API_BASE_URL}/latest-updates`, {
           signal: abortControllerRef.current.signal
         });
+
+        if (res.status === 401 || res.status === 403) {
+          logout(true);
+          return;
+        }
+
         const data = await res.json();
-        
         if (!isMounted) return;
 
-        // Update UI immediately with the payload
         setBoardStatus(data.status);
         if (data.updates && data.updates.length > 0) {
           setDeviceStates(prev => {
@@ -55,19 +65,14 @@ function App() {
             if (fIdx !== -1) setFanValue(fIdx);
           }
         }
-
-        // RECURSIVE CALL: Re-open the pipe immediately for the next message
         listenForUpdates();
-
       } catch (err) {
         if (isMounted && err.name !== 'AbortError') {
-          console.log("Reconnecting in 3s...");
-          setTimeout(listenForUpdates, 3000); // Wait 3s on error to prevent CPU spike
+          setTimeout(listenForUpdates, 3000);
         }
       }
     };
 
-    // Initial load: Probe hardware and start the listener
     sendSecureCommand(PUB_TOPIC, "0");
     listenForUpdates();
 
@@ -77,11 +82,10 @@ function App() {
     };
   }, [isAuthenticated]);
 
-  // --- API ACTIONS ---
   const sendSecureCommand = async (topic, message) => {
     const token = localStorage.getItem('kameha_token');
     try {
-      await fetch(`${API_BASE_URL}/command`, {
+      const res = await fetch(`${API_BASE_URL}/command`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -89,11 +93,16 @@ function App() {
         },
         body: JSON.stringify({ topic, message })
       });
+
+      if (res.status === 401 || res.status === 403) {
+        logout(true);
+      }
     } catch (err) { console.error("Command failed"); }
   };
 
   const login = async (e) => {
     e.preventDefault();
+    setErrorMsg('');
     try {
       const res = await fetch(`${API_BASE_URL}/login`, {
         method: 'POST',
@@ -104,19 +113,14 @@ function App() {
       if (data.token) {
         localStorage.setItem('kameha_token', data.token);
         setIsAuthenticated(true);
+      } else {
+        setErrorMsg('Invalid Master Password');
       }
-    } catch (err) { alert("Auth Server Offline"); }
-  };
-
-  const logout = () => {
-    if (abortControllerRef.current) abortControllerRef.current.abort();
-    localStorage.removeItem('kameha_token');
-    setIsAuthenticated(false);
+    } catch (err) { setErrorMsg("Auth Server Offline"); }
   };
 
   const handleToggle = (i) => {
     const newState = !deviceStates[i];
-    // Optimistic Update for zero-lag feel
     setDeviceStates(prev => { const n = [...prev]; n[i] = newState; return n; });
     sendSecureCommand(PUB_TOPIC, newState ? ON_KEYS[i] : OFF_KEYS[i]);
   };
@@ -126,6 +130,23 @@ function App() {
       <div className="app-viewport">
         <div className="glass-shell login-panel">
           <h1 className="main-logo">KAMEHA</h1>
+          
+          {errorMsg && (
+            <div style={{
+              background: 'rgba(255, 77, 77, 0.15)',
+              color: '#ff4d4d',
+              padding: '10px',
+              borderRadius: '8px',
+              marginBottom: '15px',
+              fontSize: '0.85rem',
+              border: '1px solid rgba(255, 77, 77, 0.3)',
+              textAlign: 'center',
+              width: '100%'
+            }}>
+              {errorMsg}
+            </div>
+          )}
+
           <form onSubmit={login} className="login-form">
             <input 
               type="password" placeholder="MASTER PASS" 
@@ -143,7 +164,7 @@ function App() {
     <div className="app-viewport">
       <div className="glass-shell">
         <header className="header-section">
-          <div className="logo-row" onClick={logout} style={{cursor: 'pointer'}}>
+          <div className="logo-row" onClick={() => logout(false)} style={{cursor: 'pointer'}}>
             <div className={`status-pill ${boardStatus}`}></div>
             <h1 className="main-logo">KAMEHA</h1>
           </div>
@@ -188,7 +209,6 @@ function App() {
       </div>
     </div>
   );
-  // #it ends here
 }
 
 export default App;
