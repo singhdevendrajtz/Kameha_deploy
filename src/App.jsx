@@ -18,6 +18,8 @@ function App() {
   const [boardStatus, setBoardStatus] = useState('offline');
   const abortControllerRef = useRef(null);
 
+  const baseUrl = import.meta.env.BASE_URL;
+
   const logout = (isExpired = false) => {
     if (abortControllerRef.current) abortControllerRef.current.abort();
     localStorage.removeItem('kameha_token');
@@ -25,6 +27,35 @@ function App() {
     if (isExpired) {
       setErrorMsg('Session expired. Please login again.');
     }
+  };
+
+  const sendSecureCommand = async (topic, message) => {
+    const token = localStorage.getItem('kameha_token');
+    try {
+      const res = await fetch(`${API_BASE_URL}/command`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ topic, message })
+      });
+
+      if (res.status === 401 || res.status === 403) {
+        logout(true);
+      }
+    } catch (err) { console.error("Command failed"); }
+  };
+
+  // --- MASTER CONTROLS ---
+  const allOn = () => {
+    ON_KEYS.forEach(key => sendSecureCommand(PUB_TOPIC, key));
+    setDeviceStates(new Array(6).fill(true));
+  };
+
+  const allOff = () => {
+    OFF_KEYS.forEach(key => sendSecureCommand(PUB_TOPIC, key));
+    setDeviceStates(new Array(6).fill(false));
   };
 
   useEffect(() => {
@@ -82,24 +113,6 @@ function App() {
     };
   }, [isAuthenticated]);
 
-  const sendSecureCommand = async (topic, message) => {
-    const token = localStorage.getItem('kameha_token');
-    try {
-      const res = await fetch(`${API_BASE_URL}/command`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({ topic, message })
-      });
-
-      if (res.status === 401 || res.status === 403) {
-        logout(true);
-      }
-    } catch (err) { console.error("Command failed"); }
-  };
-
   const login = async (e) => {
     e.preventDefault();
     setErrorMsg('');
@@ -130,7 +143,6 @@ function App() {
       <div className="app-viewport">
         <div className="glass-shell login-panel">
           <h1 className="main-logo">KAMEHA</h1>
-          
           {errorMsg && (
             <div style={{
               background: 'rgba(255, 77, 77, 0.15)',
@@ -146,7 +158,6 @@ function App() {
               {errorMsg}
             </div>
           )}
-
           <form onSubmit={login} className="login-form">
             <input 
               type="password" placeholder="MASTER PASS" 
@@ -169,6 +180,12 @@ function App() {
             <h1 className="main-logo">KAMEHA</h1>
           </div>
         </header>
+
+        {/* --- ADDED MASTER BUTTONS --- */}
+        <div className="master-controls" style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
+          <button onClick={allOn} className="m-btn" style={{ flex: 1, padding: '12px' }}>ALL ON</button>
+          <button onClick={allOff} className="m-btn" style={{ flex: 1, padding: '12px' }}>ALL OFF</button>
+        </div>
 
         <section className="fan-panel">
           <div className="fan-meta">
@@ -195,7 +212,7 @@ function App() {
           {deviceStates.map((isOn, i) => (
             <button key={i} className={`tile ${isOn ? 'on' : ''}`} onClick={() => handleToggle(i)}>
               <img 
-                src={i === 3 ? '/fan-3.svg' : (isOn ? '/bright-light-bulb-svgrepo-com.svg' : '/light-bulb-svgrepo-com.svg')} 
+                src={`${baseUrl}${i === 3 ? 'fan-3.svg' : (isOn ? 'bright-light-bulb-svgrepo-com.svg' : 'light-bulb-svgrepo-com.svg')}`} 
                 className={i === 3 && isOn ? 'spin' : ''} 
                 alt="icon" 
               />
