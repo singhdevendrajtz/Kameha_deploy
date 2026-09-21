@@ -2,19 +2,17 @@ import React, { useState, useEffect, useRef } from 'react';
 import './App.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
-const PUB_TOPIC = import.meta.env.VITE_HARDWARE_TOPIC;
+const PUB_TOPIC = import.meta.env.VITE_HARDWARE_TOPIC || 'innsub5';
 
-const OFF_KEYS = ["a", "b", "c", "d", "e", "f"];
-const ON_KEYS = ["1", "2", "3", "4", "5", "6"];
-const FAN_STATES = ["FTRP0000", "FTRP0001", "FTRP0010", "FTRP0011", "FTRP0100"];
-const FAN_LABELS = ["Power Off", "Silent", "Normal", "Boost", "Turbo"];
+// Updated command mappings per your specs
+const ON_KEYS = ["1", "2", "5", "6", "7"];
+const OFF_KEYS = ["a", "b", "e", "f", "g"];
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(!!localStorage.getItem('kameha_token'));
   const [password, setPassword] = useState('');
   const [errorMsg, setErrorMsg] = useState(''); 
-  const [deviceStates, setDeviceStates] = useState(new Array(6).fill(false));
-  const [fanValue, setFanValue] = useState(0);
+  const [deviceStates, setDeviceStates] = useState(new Array(5).fill(false));
   const [boardStatus, setBoardStatus] = useState('offline');
   const abortControllerRef = useRef(null);
 
@@ -44,18 +42,27 @@ function App() {
       if (res.status === 401 || res.status === 403) {
         logout(true);
       }
-    } catch (err) { console.error("Command failed"); }
+      return true;
+    } catch (err) { 
+      console.error("Command failed"); 
+      return false;
+    }
   };
 
-  // --- MASTER CONTROLS ---
-  const allOn = () => {
-    ON_KEYS.forEach(key => sendSecureCommand(PUB_TOPIC, key));
-    setDeviceStates(new Array(6).fill(true));
+  const allOn = async () => {
+    setDeviceStates(new Array(5).fill(true));
+    for (const key of ON_KEYS) {
+      await sendSecureCommand(PUB_TOPIC, key);
+      await new Promise(resolve => setTimeout(resolve, 30));
+    }
   };
 
-  const allOff = () => {
-    OFF_KEYS.forEach(key => sendSecureCommand(PUB_TOPIC, key));
-    setDeviceStates(new Array(6).fill(false));
+  const allOff = async () => {
+    setDeviceStates(new Array(5).fill(false));
+    for (const key of OFF_KEYS) {
+      await sendSecureCommand(PUB_TOPIC, key);
+      await new Promise(resolve => setTimeout(resolve, 30));
+    }
   };
 
   useEffect(() => {
@@ -65,7 +72,7 @@ function App() {
     const listenForUpdates = async () => {
       abortControllerRef.current = new AbortController();
       try {
-        const res = await fetch(`${API_BASE_URL}/latest-updates`, {
+        const res = await fetch(`${API_BASE_URL}/latest-updates?topic=${encodeURIComponent(PUB_TOPIC)}`, {
           signal: abortControllerRef.current.signal
         });
 
@@ -89,12 +96,6 @@ function App() {
             });
             return newState;
           });
-
-          const fanMsg = [...data.updates].reverse().find(m => m.startsWith("FTRP"));
-          if (fanMsg) {
-            const fIdx = FAN_STATES.indexOf(fanMsg);
-            if (fIdx !== -1) setFanValue(fIdx);
-          }
         }
         listenForUpdates();
       } catch (err) {
@@ -181,43 +182,20 @@ function App() {
           </div>
         </header>
 
-        {/* --- ADDED MASTER BUTTONS --- */}
         <div className="master-controls" style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
           <button onClick={allOn} className="m-btn" style={{ flex: 1, padding: '12px' }}>ALL ON</button>
           <button onClick={allOff} className="m-btn" style={{ flex: 1, padding: '12px' }}>ALL OFF</button>
         </div>
 
-        <section className="fan-panel">
-          <div className="fan-meta">
-            <span>Airflow Intensity</span>
-            <span className="fan-mode">{FAN_LABELS[fanValue]}</span>
-          </div>
-          <div className="slider-wrapper">
-            <div className="fan-dots">
-              {[0, 1, 2, 3, 4].map(d => <div key={d} className={`dot ${fanValue >= d ? 'active' : ''}`} />)}
-            </div>
-            <input 
-              type="range" min="0" max="4" step="1" value={fanValue} 
-              onChange={(e) => {
-                const v = parseInt(e.target.value);
-                setFanValue(v);
-                sendSecureCommand(PUB_TOPIC, FAN_STATES[v]);
-              }}
-              className="dot-slider"
-            />
-          </div>
-        </section>
-
         <div className={`grid-container ${boardStatus}`}>
           {deviceStates.map((isOn, i) => (
             <button key={i} className={`tile ${isOn ? 'on' : ''}`} onClick={() => handleToggle(i)}>
               <img 
-                src={`${baseUrl}${i === 3 ? 'fan-3.svg' : (isOn ? 'bright-light-bulb-svgrepo-com.svg' : 'light-bulb-svgrepo-com.svg')}`} 
-                className={i === 3 && isOn ? 'spin' : ''} 
+                src={`${baseUrl}${isOn ? 'bright-light-bulb-svgrepo-com.svg' : 'light-bulb-svgrepo-com.svg'}`} 
                 alt="icon" 
               />
               <div className="tile-info">
-                <span className="t-name">{i === 3 ? "Main Fan" : `Light 0${i + 1}`}</span>
+                <span className="t-name">{`Light 0${i + 1}`}</span>
                 <span className="t-status">{isOn ? 'ACTIVE' : 'IDLE'}</span>
               </div>
             </button>
