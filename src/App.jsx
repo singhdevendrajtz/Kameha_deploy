@@ -1,27 +1,31 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
+import { io } from 'socket.io-client';
 import './App.css';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
-const PUB_TOPIC = import.meta.env.VITE_HARDWARE_TOPIC;
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "https://kameha.in:5000/api";
+const PUB_TOPIC = import.meta.env.VITE_HARDWARE_TOPIC || 'Innsub4';
+const SUB_TOPIC = import.meta.env.VITE_STATUS_TOPIC || 'otto6';
 
 const OFF_KEYS = ["a", "b", "c", "d", "e", "f"];
 const ON_KEYS = ["1", "2", "3", "4", "5", "6"];
 const FAN_STATES = ["FTRP0000", "FTRP0001", "FTRP0010", "FTRP0011", "FTRP0100"];
 const FAN_LABELS = ["Power Off", "Silent", "Normal", "Boost", "Turbo"];
 
-function App() {
-  const [isAuthenticated, setIsAuthenticated] = useState(!!localStorage.getItem('kameha_token'));
+export default function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(Boolean(localStorage.getItem('kameha_token')));
   const [password, setPassword] = useState('');
   const [errorMsg, setErrorMsg] = useState(''); 
-  const [deviceStates, setDeviceStates] = useState(new Array(6).fill(false));
+  const [deviceStates, setDeviceStates] = useState([false, false, false, false, false, false]);
   const [fanValue, setFanValue] = useState(0);
   const [boardStatus, setBoardStatus] = useState('offline');
-  const abortControllerRef = useRef(null);
 
   const baseUrl = import.meta.env.BASE_URL;
 
-  const logout = (isExpired = false) => {
-    if (abortControllerRef.current) abortControllerRef.current.abort();
+  const getSocketUrl = function(url) {
+    return url.replace(/\/api\/?$/, '');
+  };
+
+  const logout = function(isExpired) {
     localStorage.removeItem('kameha_token');
     setIsAuthenticated(false);
     if (isExpired) {
@@ -29,203 +33,247 @@ function App() {
     }
   };
 
-  const sendSecureCommand = async (topic, message) => {
+  const sendSecureCommand = async function(topic, message) {
     const token = localStorage.getItem('kameha_token');
     try {
-      const res = await fetch(`${API_BASE_URL}/command`, {
+      const res = await fetch(API_BASE_URL + '/command', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': 'Bearer ' + token
         },
-        body: JSON.stringify({ topic, message })
+        body: JSON.stringify({ topic: topic, message: message })
       });
 
       if (res.status === 401 || res.status === 403) {
         logout(true);
       }
-    } catch (err) { console.error("Command failed"); }
+    } catch (err) { 
+      console.error("Command failed", err);
+    }
   };
 
-  // --- MASTER CONTROLS ---
-  const allOn = () => {
-    ON_KEYS.forEach(key => sendSecureCommand(PUB_TOPIC, key));
-    setDeviceStates(new Array(6).fill(true));
+  const allOn = function() {
+    for (let i = 0; i < ON_KEYS.length; i++) {
+      sendSecureCommand(PUB_TOPIC, ON_KEYS[i]);
+    }
+    setDeviceStates([true, true, true, true, true, true]);
   };
 
-  const allOff = () => {
-    OFF_KEYS.forEach(key => sendSecureCommand(PUB_TOPIC, key));
-    setDeviceStates(new Array(6).fill(false));
+  const allOff = function() {
+    for (let i = 0; i < OFF_KEYS.length; i++) {
+      sendSecureCommand(PUB_TOPIC, OFF_KEYS[i]);
+    }
+    setDeviceStates([false, false, false, false, false, false]);
   };
 
-  useEffect(() => {
+  useEffect(function() {
     if (!isAuthenticated) return;
-    let isMounted = true;
 
-    const listenForUpdates = async () => {
-      abortControllerRef.current = new AbortController();
-      try {
-        const res = await fetch(`${API_BASE_URL}/latest-updates`, {
-          signal: abortControllerRef.current.signal
-        });
+    const socket = io(getSocketUrl(API_BASE_URL), {
+      secure: true,
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000
+    });
 
-        if (res.status === 401 || res.status === 403) {
-          logout(true);
-          return;
-        }
+    socket.on('connect', function() {
+      socket.emit('join_board', SUB_TOPIC);
+      sendSecureCommand(PUB_TOPIC, "0");
+    });
 
-        const data = await res.json();
-        if (!isMounted) return;
-
+    socket.on('board_update', function(data) {
+      if (data.status) {
         setBoardStatus(data.status);
-        if (data.updates && data.updates.length > 0) {
-          setDeviceStates(prev => {
-            const newState = [...prev];
-            data.updates.forEach(msg => {
-              const onIdx = ON_KEYS.indexOf(msg);
-              const offIdx = OFF_KEYS.indexOf(msg);
-              if (onIdx !== -1) newState[onIdx] = true;
-              if (offIdx !== -1) newState[offIdx] = false;
-            });
+      }
+
+      let msg = data.message || data;
+      if (typeof msg === 'object' && msg !== null && msg.message) {
+        msg = msg.message;
+      }
+
+      if (typeof msg === 'string') {
+        // 1. Process Relay Key Commands ("1"-"6" -> ON, "a"-"f" -> OFF)
+        const onIdx = ON_KEYS.indexOf(msg);
+        const offIdx = OFF_KEYS.indexOf(msg);
+
+        if (onIdx !== -1 || offIdx !== -1) {
+          setDeviceStates(function(prev) {
+            const newState = prev.slice();
+            if (onIdx !== -1) newState[onIdx] = true;
+            if (offIdx !== -1) newState[offIdx] = false;
             return newState;
           });
+        }
 
-          const fanMsg = [...data.updates].reverse().find(m => m.startsWith("FTRP"));
-          if (fanMsg) {
-            const fIdx = FAN_STATES.indexOf(fanMsg);
-            if (fIdx !== -1) setFanValue(fIdx);
+        // 2. Process Fan Speed Slider Payload ("FTRP...") independently
+        if (msg.indexOf("FTRP") === 0) {
+          const fIdx = FAN_STATES.indexOf(msg);
+          if (fIdx !== -1) {
+            setFanValue(fIdx); // Updates only the slider position & label
           }
         }
-        listenForUpdates();
-      } catch (err) {
-        if (isMounted && err.name !== 'AbortError') {
-          setTimeout(listenForUpdates, 3000);
-        }
       }
-    };
+    });
 
-    sendSecureCommand(PUB_TOPIC, "0");
-    listenForUpdates();
-
-    return () => {
-      isMounted = false;
-      if (abortControllerRef.current) abortControllerRef.current.abort();
+    return function() {
+      socket.disconnect();
     };
   }, [isAuthenticated]);
 
-  const login = async (e) => {
+  const login = async function(e) {
     e.preventDefault();
     setErrorMsg('');
     try {
-      const res = await fetch(`${API_BASE_URL}/login`, {
+      const res = await fetch(API_BASE_URL + '/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password })
+        body: JSON.stringify({ 
+          password: password,
+          boardId: SUB_TOPIC 
+        })
       });
       const data = await res.json();
       if (data.token) {
         localStorage.setItem('kameha_token', data.token);
         setIsAuthenticated(true);
       } else {
-        setErrorMsg('Invalid Master Password');
+        setErrorMsg(data.error || 'Invalid Master Password');
       }
-    } catch (err) { setErrorMsg("Auth Server Offline"); }
+    } catch (err) { 
+      setErrorMsg("Auth Server Offline"); 
+    }
   };
 
-  const handleToggle = (i) => {
+  const handleToggle = function(i) {
+    if (boardStatus === 'offline') return;
     const newState = !deviceStates[i];
-    setDeviceStates(prev => { const n = [...prev]; n[i] = newState; return n; });
+
+    // Optimistically update device states
+    setDeviceStates(function(prev) {
+      const n = prev.slice();
+      n[i] = newState;
+      return n;
+    });
+
+    // Sends "4" for Main Fan ON and "d" for Main Fan OFF (independent of slider)
     sendSecureCommand(PUB_TOPIC, newState ? ON_KEYS[i] : OFF_KEYS[i]);
   };
 
-  if (!isAuthenticated) {
-    return (
-      <div className="app-viewport">
-        <div className="glass-shell login-panel">
-          <h1 className="main-logo">KAMEHA</h1>
-          {errorMsg && (
-            <div style={{
-              background: 'rgba(255, 77, 77, 0.15)',
-              color: '#ff4d4d',
-              padding: '10px',
-              borderRadius: '8px',
-              marginBottom: '15px',
-              fontSize: '0.85rem',
-              border: '1px solid rgba(255, 77, 77, 0.3)',
-              textAlign: 'center',
-              width: '100%'
-            }}>
-              {errorMsg}
-            </div>
-          )}
-          <form onSubmit={login} className="login-form">
-            <input 
-              type="password" placeholder="MASTER PASS" 
-              className="m-btn login-input"
-              value={password} onChange={(e) => setPassword(e.target.value)}
-            />
-            <button type="submit" className="m-btn login-submit">ACCESS</button>
-          </form>
-        </div>
-      </div>
+  const renderLoginView = function() {
+    return React.createElement('div', { className: 'app-viewport' },
+      React.createElement('div', { className: 'glass-shell login-panel' },
+        React.createElement('h1', { className: 'main-logo' }, 'KAMEHA'),
+        errorMsg ? React.createElement('div', {
+          style: {
+            background: 'rgba(255, 77, 77, 0.15)',
+            color: '#ff4d4d',
+            padding: '10px',
+            borderRadius: '8px',
+            marginBottom: '15px',
+            fontSize: '0.85rem',
+            border: '1px solid rgba(255, 77, 77, 0.3)',
+            textAlign: 'center',
+            width: '100%'
+          }
+        }, errorMsg) : null,
+        React.createElement('form', { onSubmit: login, className: 'login-form' },
+          React.createElement('input', {
+            type: 'password',
+            placeholder: 'MASTER PASS',
+            className: 'm-btn login-input',
+            value: password,
+            onChange: function(e) { setPassword(e.target.value); }
+          }),
+          React.createElement('button', { type: 'submit', className: 'm-btn login-submit' }, 'ACCESS')
+        )
+      )
     );
-  }
+  };
 
-  return (
-    <div className="app-viewport">
-      <div className="glass-shell">
-        <header className="header-section">
-          <div className="logo-row" onClick={() => logout(false)} style={{cursor: 'pointer'}}>
-            <div className={`status-pill ${boardStatus}`}></div>
-            <h1 className="main-logo">KAMEHA</h1>
-          </div>
-        </header>
-
-        {/* --- ADDED MASTER BUTTONS --- */}
-        <div className="master-controls" style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
-          <button onClick={allOn} className="m-btn" style={{ flex: 1, padding: '12px' }}>ALL ON</button>
-          <button onClick={allOff} className="m-btn" style={{ flex: 1, padding: '12px' }}>ALL OFF</button>
-        </div>
-
-        <section className="fan-panel">
-          <div className="fan-meta">
-            <span>Airflow Intensity</span>
-            <span className="fan-mode">{FAN_LABELS[fanValue]}</span>
-          </div>
-          <div className="slider-wrapper">
-            <div className="fan-dots">
-              {[0, 1, 2, 3, 4].map(d => <div key={d} className={`dot ${fanValue >= d ? 'active' : ''}`} />)}
-            </div>
-            <input 
-              type="range" min="0" max="4" step="1" value={fanValue} 
-              onChange={(e) => {
-                const v = parseInt(e.target.value);
+  const renderDashboardView = function() {
+    return React.createElement('div', { className: 'app-viewport' },
+      React.createElement('div', { className: 'glass-shell' },
+        React.createElement('header', { className: 'header-section' },
+          React.createElement('div', { 
+            className: 'logo-row', 
+            onClick: function() { logout(false); }, 
+            style: { cursor: 'pointer' } 
+          },
+            React.createElement('div', { className: 'status-pill ' + boardStatus }),
+            React.createElement('h1', { className: 'main-logo' }, 'KAMEHA')
+          )
+        ),
+        React.createElement('div', { className: 'master-controls', style: { display: 'flex', gap: '10px', marginBottom: '20px' } },
+          React.createElement('button', {
+            onClick: allOn,
+            className: 'm-btn',
+            style: { flex: 1, padding: '12px' },
+            disabled: boardStatus === 'offline'
+          }, 'ALL ON'),
+          React.createElement('button', {
+            onClick: allOff,
+            className: 'm-btn',
+            style: { flex: 1, padding: '12px' },
+            disabled: boardStatus === 'offline'
+          }, 'ALL OFF')
+        ),
+        React.createElement('section', { className: 'fan-panel' },
+          React.createElement('div', { className: 'fan-meta' },
+            React.createElement('span', null, 'Airflow Intensity'),
+            React.createElement('span', { className: 'fan-mode' }, FAN_LABELS[fanValue])
+          ),
+          React.createElement('div', { className: 'slider-wrapper' },
+            React.createElement('div', { className: 'fan-dots' },
+              [0, 1, 2, 3, 4].map(function(d) {
+                return React.createElement('div', {
+                  key: d,
+                  className: 'dot ' + (fanValue >= d ? 'active' : '')
+                });
+              })
+            ),
+            React.createElement('input', {
+              type: 'range',
+              min: '0',
+              max: '4',
+              step: '1',
+              value: fanValue,
+              disabled: boardStatus === 'offline',
+              onChange: function(e) {
+                const v = parseInt(e.target.value, 10);
                 setFanValue(v);
                 sendSecureCommand(PUB_TOPIC, FAN_STATES[v]);
-              }}
-              className="dot-slider"
-            />
-          </div>
-        </section>
+              },
+              className: 'dot-slider'
+            })
+          )
+        ),
+        React.createElement('div', { className: 'grid-container ' + boardStatus },
+          deviceStates.map(function(isOn, i) {
+            const isFan = i === 3;
+            const iconName = isFan ? 'fan-3.svg' : (isOn ? 'bright-light-bulb-svgrepo-com.svg' : 'light-bulb-svgrepo-com.svg');
+            const tileName = isFan ? 'Main Fan' : ('Light 0' + (i + 1));
+            
+            return React.createElement('button', {
+              key: i,
+              className: 'tile ' + (isOn ? 'on' : ''),
+              onClick: function() { handleToggle(i); }
+            },
+              React.createElement('img', {
+                src: baseUrl + iconName,
+                className: isFan && isOn ? 'spin' : '',
+                alt: 'icon'
+              }),
+              React.createElement('div', { className: 'tile-info' },
+                React.createElement('span', { className: 't-name' }, tileName),
+                React.createElement('span', { className: 't-status' }, isOn ? 'ACTIVE' : 'IDLE')
+              )
+            );
+          })
+        )
+      )
+    );
+  };
 
-        <div className={`grid-container ${boardStatus}`}>
-          {deviceStates.map((isOn, i) => (
-            <button key={i} className={`tile ${isOn ? 'on' : ''}`} onClick={() => handleToggle(i)}>
-              <img 
-                src={`${baseUrl}${i === 3 ? 'fan-3.svg' : (isOn ? 'bright-light-bulb-svgrepo-com.svg' : 'light-bulb-svgrepo-com.svg')}`} 
-                className={i === 3 && isOn ? 'spin' : ''} 
-                alt="icon" 
-              />
-              <div className="tile-info">
-                <span className="t-name">{i === 3 ? "Main Fan" : `Light 0${i + 1}`}</span>
-                <span className="t-status">{isOn ? 'ACTIVE' : 'IDLE'}</span>
-              </div>
-            </button>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
+  return isAuthenticated ? renderDashboardView() : renderLoginView();
 }
-
-export default App;
